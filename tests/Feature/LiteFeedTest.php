@@ -8,6 +8,15 @@ use Tests\ApiTestCase;
 /** Versión Lite: el feed es más liviano pero sigue cumpliendo el contrato que usa la app. */
 class LiteFeedTest extends ApiTestCase
 {
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        // En CI el .env.example trae el disco s3 sin bucket y ListingMediaResource intentaría
+        // resolver la URL contra S3. Con el disco público la URL se arma localmente.
+        config(['filesystems.default' => 'public']);
+    }
+
     private function fotos(int $publicacionId, int $cuantas): void
     {
         for ($i = 0; $i < $cuantas; $i++) {
