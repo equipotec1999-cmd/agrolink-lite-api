@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  phpunit:
+    runs-on: ubuntu-latest
+    name: PHPUnit (PHP 8.3 + PostGIS)
+
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agrolink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo, pdo_pgsql, pgsql, bcmath, intl
+          coverage: none
+
+      - name: Dependencias
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Entorno
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Pruebas
+        run: |
+          set +e
+          vendor/bin/phpunit --display-warnings --display-skipped > phpunit-out.txt 2>&1
+          code=$?
+          cat phpunit-out.txt
+          if [ $code -ne 0 ]; then
+            # Resumen de fallos como anotación (se puede leer sin descargar los logs).
+            msg=$(grep -vE '^\s*$' phpunit-out.txt | grep -vE '^(PHPUnit|Runtime|Configuration|Random)' | tail -c 30000 | sed ':a;N;$!ba;s/%/%25/g;s/\r//g;s/\n/%0A/g')
+            echo "::error title=PHPUnit fallo::$msg"
+          fi
+          exit $code

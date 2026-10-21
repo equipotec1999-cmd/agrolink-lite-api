@@ -1,0 +1,166 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Auth\LoginRequest;
+use App\Http\Requests\Auth\RegisterRequest;
+use App\Http\Resources\UserResource;
+use App\Models\Profile;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\ValidationException;
+
+class AuthController extends Controller
+{
+    public function register(RegisterRequest $request, \App\Services\ContactVerificationService $verify)
+    {
+        $user = DB::transaction(function () use ($request) {
+            $user = User::create([
+                'nombre' => $request->string('name'),
+                'apellidos' => $request->input('lastname'),
+                'correo' => $request->input('email'),
+                'telefono' => $request->input('phone'),
+                'contrasena' => $request->string('password'),
+            ]);
+
+            Profile::create(['usuario_id' => $user->id]);
+
+            return $user;
+        });
+
+        // Con la confirmación apagada la cuenta entra directo con su token.
+        if (! config('app.verificar_correo')) {
+            return response()->json([
+                'user' => new UserResource($user->load(['profile', 'sellerProfile'])),
+                'token' => $user->createToken('registro')->plainTextToken,
+            ], 201);
+        }
+
+        // Con la confirmación encendida la cuenta queda sin sesión hasta validar el código
+        // enviado al correo; el token completo se entrega en /verify-contact.
+        $verify->send($user, 'email', $user->correo);
+
+        return response()->json([
+            'user' => new UserResource($user),
+            'verification' => [
+                'channel' => 'email',
+                'destination' => $user->correo,
+                'expires_in_minutes' => 15,
+            ],
+        ], 201);
+    }
+
+    /** Validar el código de confirmación: marca el contacto como verificado y entrega el token completo. */
+    public function verifyContact(Request $request, \App\Services\ContactVerificationService $verify)
+    {
+        $data = $request->validate([
+            'destination' => ['required', 'string', 'max:180'],
+            'code' => ['required', 'string', 'size:6'],
+            'device_name' => ['nullable', 'string', 'max:120'],
+        ]);
+
+        $result = $verify->verify($data['destination'], $data['code']);
+        $user = $result['user'];
+        $token = $user->createToken($data['device_name'] ?? 'registro')->plainTextToken;
+
+        return response()->json([
+            'user' => new UserResource($user->load(['profile', 'sellerProfile'])),
+            'token' => $token,
+            'verified_channel' => $result['channel'],
+        ]);
+    }
+
+    /** Reenvía el código al mismo contacto. Rate-limited por ruta. */
+    public function resendVerification(Request $request, \App\Services\ContactVerificationService $verify)
+    {
+        $data = $request->validate([
+            'destination' => ['required', 'string', 'max:180'],
+        ]);
+
+        $user = User::where('correo', $data['destination'])->first();
+        if (! $user) {
+            // Respuesta genérica para no revelar si existe o no la cuenta.
+            return response()->json(['message' => 'Si el contacto existe, enviamos un nuevo código.']);
+        }
+        $verify->send($user, 'email', $user->correo);
+
+        return response()->json(['message' => 'Código reenviado.']);
+    }
+
+    public function login(LoginRequest $request)
+    {
+        $user = User::where('correo', $request->string('email'))->first();
+
+        // Mensaje genérico a propósito: no revela si falló el correo o la contraseña.
+        if (! $user || ! Hash::check($request->string('password'), $user->contrasena)) {
+            throw ValidationException::withMessages([
+                'email' => ['Correo o contraseña incorrectos.'],
+            ]);
+        }
+
+        // Con verificación en dos pasos: solo un token pendiente (10 min) que únicamente
+        // sirve para /two-factor/challenge; el token completo llega al validar el código.
+        if ($user->hasTwoFactorEnabled()) {
+            return response()->json([
+                'requires_two_factor' => true,
+                'challenge_token' => $user->createToken(
+                    (string) $request->string('device_name'),
+                    ['two-factor-pending'],
+                    now()->addMinutes(10),
+                )->plainTextToken,
+            ]);
+        }
+
+        $token = $user->createToken($request->string('device_name'))->plainTextToken;
+
+        return response()->json([
+            'user' => new UserResource($user),
+            'token' => $token,
+        ]);
+    }
+
+    public function logout(Request $request)
+    {
+        $request->user()->currentAccessToken()->delete();
+
+        return response()->json(['message' => 'Sesión cerrada.']);
+    }
+
+    public function me(Request $request)
+    {
+        return new UserResource($request->user()->load(['profile', 'sellerProfile']));
+    }
+    /**
+     * Paso 1: pide el código. Siempre responde 200 (no revelamos si el correo existe).
+     * Si existe la cuenta, se le envía un código de 6 dígitos por correo.
+     */
+    public function forgotPassword(Request $request, \App\Services\ContactVerificationService $verify)
+    {
+        $data = $request->validate(['email' => ['required', 'email']]);
+        $email = strtolower(trim($data['email']));
+        $user = \App\Models\User::where('correo', $email)->first();
+        if ($user) {
+            $verify->sendPasswordReset($user, $email);
+        }
+        return response()->json(['message' => 'Si el correo existe, enviamos un código.']);
+    }
+
+    /** Paso 2: con el código correcto cambia la contraseña y cierra las sesiones previas. */
+    public function resetPassword(Request $request, \App\Services\ContactVerificationService $verify)
+    {
+        $data = $request->validate([
+            'email' => ['required', 'email'],
+            'code' => ['required', 'string', 'size:6'],
+            'password' => ['required', 'string', 'min:8', 'regex:/[A-Z]/', 'regex:/[a-z]/', 'regex:/[0-9]/'],
+        ]);
+        $user = $verify->verifyPasswordReset(strtolower(trim($data['email'])), $data['code']);
+        $user->forceFill(['contrasena' => $data['password']])->save();
+        // Revocar todos los tokens activos para forzar un inicio de sesión fresco.
+        $user->tokens()->delete();
+        return response()->json(['message' => 'Contraseña actualizada.']);
+    }
+
+}
